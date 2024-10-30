@@ -609,8 +609,7 @@ static ncclResult_t scheduleP2pTasksToPlan(
 
   // Compute how much to split operations
   // Natural step size matching buffer steps.
-  ssize_t stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
-  if (comm->nNodes > 1) stepSize = comm->p2pNetChunkSize;
+  ssize_t stepSize = comm->p2pChunkSize;
   // Try to use all channels
   int nChannelsMax = comm->p2pnChannelsPerPeer;
   int nChannelsMin = nChannelsMax;
@@ -853,6 +852,7 @@ static ncclResult_t hostStreamPlanTask(struct ncclComm* comm, struct ncclKernelP
 }
 
 static void CUDART_CB hostStreamPlanCallback(void *plan_) {
+  NVTX3_FUNC_RANGE_IN(nccl_domain);
   struct ncclKernelPlan* plan = (struct ncclKernelPlan*)plan_;
   ncclResult_t result = hostStreamPlanTask(plan->comm, plan);
   if (result != ncclSuccess) {
@@ -940,14 +940,33 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
     struct ncclKernelPlan* planHead = ncclIntruQueueHead(&comm->planQueue);
     comm->unlaunchedPlansHead = planHead;
 
+    // Semantically we want these dependencies for the kernels launched:
+    //   1. Launch host task on hostStream.
+    //   2. Launch kernel, depends on all of {deviceStream, hostStream, userStream[i]...}
+    //   3. {deviceStream, userStream[i]...} depend on kernel.
+    // We achieve this by:
+    //   1. userStream[0] waits on deviceStream
+    //   2. deviceStream waits on each of userStream[1...]
+    //   3. host task launch on hostStream
+    //   4. userStream[0] waits on hostStream
+    //   5. kernel launch on userStream[0]
+    //   6. deviceStream waits on userStream[0]
+    //   7. userStream[1...] each waits on deviceStream
+    // The two-level fan-in fan-out is because ncclStrongStreamWaitStream() requires
+    // at least one of the two streams to be strong-stream.
+    cudaStream_t launchStream = tasks->streams->stream;
     NCCLCHECKGOTO(ncclStrongStreamAcquire(tasks->capturingGraph, &comm->deviceStream), result, failure);
 
-    // Create dependency for nccl device work on user streams.
-    for (struct ncclCudaStreamList* l=tasks->streams; l != nullptr; l = l->next) {
+    // Create dependency for device stream on user streams. First from extra user
+    // streams to deviceStream. Then deviceStream to first user stream.
+    for (struct ncclCudaStreamList* l=tasks->streams->next; l != nullptr; l = l->next) {
       NCCLCHECKGOTO(ncclStrongStreamWaitStream(tasks->capturingGraph, &comm->deviceStream, l->stream), result, failure);
     }
+    NCCLCHECKGOTO(ncclStrongStreamWaitStream(tasks->capturingGraph, launchStream, &comm->deviceStream), result, failure);
 
     if (persistent || comm->persistentRefs != 0) {
+      // We have to launch host tasks to push proxy args. We are careful to only
+      // do this if necessary since host tasks impose a high performance cost in CUDA.
       bool acquired = false;
       for (struct ncclKernelPlan* plan=planHead; plan != nullptr; plan = plan->next) {
         if (plan->hasProxyOps) {
@@ -959,6 +978,8 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
         }
       }
       if (acquired) {
+        // Make to-be-launched kernels dependent on just-launched host stream tasks.
+        NCCLCHECKGOTO(ncclStrongStreamWaitStream(tasks->capturingGraph, launchStream, &comm->hostStream), result, failure);
         NCCLCHECKGOTO(ncclStrongStreamRelease(tasks->capturingGraph, &comm->hostStream), result, failure);
       }
     }
@@ -984,14 +1005,84 @@ ncclResult_t ncclLaunchKernelBefore_NoUncapturedCuda(struct ncclComm* comm, stru
   return ncclSuccess;
 }
 
+#if CUDART_VERSION >= 11080
+#define NCCL_MAX_CGA_CLUSTER_SIZE 8
+#define NCCL_CGA_CLUSTER_SIZE_SM90 4
+NCCL_PARAM(CGAClusterSize, "CGA_CLUSTER_SIZE", -2);
+#endif
+
+#if CUDART_VERSION >= 12000
+// NCCL uses the "Remote" Mem Sync domain by default
+NCCL_PARAM(MemSyncDomain, "MEM_SYNC_DOMAIN", cudaLaunchMemSyncDomainRemote);
+#endif
+
 ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   struct ncclTasks* tasks = &comm->tasks;
+  void *fn = plan->kernelFn;
+  cudaStream_t launchStream = tasks->streams->stream;
   dim3 grid = {(unsigned)plan->channelCount, 1, 1};
   dim3 block = {(unsigned)plan->threadPerBlock, 1, 1};
   void *args[3] = {&comm->devComm, &plan->channelMask, &plan->workHead};
-  NCCLCHECK(ncclStrongStreamLaunchKernel(
-    tasks->capturingGraph, &comm->deviceStream, plan->kernelFn, grid, block, args, 0
-  ));
+
+  #if CUDART_VERSION >= 11080
+  int driverVersion;
+  NCCLCHECK(ncclCudaDriverVersion(&driverVersion));
+  if (driverVersion >= 11080) {
+    int compCap = comm->compCap;
+    unsigned int clusterSize = (compCap == 90) ? NCCL_CGA_CLUSTER_SIZE_SM90 : 0;
+    if (ncclParamCGAClusterSize() != -2) {
+      clusterSize = ncclParamCGAClusterSize();
+      if (clusterSize > NCCL_MAX_CGA_CLUSTER_SIZE) {
+        static bool warned = false;
+        if (warned == false) {
+          WARN("NCCL_CGA_CLUSTER_SIZE value %d is too big. Limiting value to %d.",
+               clusterSize, NCCL_MAX_CGA_CLUSTER_SIZE);
+          warned = true;
+        }
+        clusterSize = NCCL_MAX_CGA_CLUSTER_SIZE;
+      }
+    }
+
+    cudaLaunchConfig_t launchConfig = {0};
+    cudaLaunchAttribute launchAttrs[3];
+    int attrs = 0;
+    /* Cooperative Group Array (CGA)
+     * On sm90 and later we have an extra level of hierarchy where we
+     * can group together several blocks within the Grid, called
+     * Thread Block Clusters.
+     * Clusters enable multiple thread blocks running concurrently
+     * across multiple SMs to synchronize and collaboratively fetch
+     * and exchange data. A cluster of blocks are guaranteed to be
+     * concurrently scheduled onto a group of SMs.
+     * The maximum value is 8 and it must be divisible into the grid dimensions
+     */
+    if (clusterSize) {
+      // Grid dimension must be divisible by clusterSize
+      if (grid.x % clusterSize) clusterSize = 1;
+      launchAttrs[attrs].id = cudaLaunchAttributeClusterDimension;
+      launchAttrs[attrs++].val.clusterDim = {clusterSize, 1, 1};
+      launchAttrs[attrs].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
+      launchAttrs[attrs++].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
+    }
+    #if CUDART_VERSION >= 12000
+    if (compCap >= 90 && driverVersion >= 12000) {
+      // Set the NCCL Mem Sync domain on CUDA 12.0 and later (sm90)
+      launchAttrs[attrs].id = cudaLaunchAttributeMemSyncDomain;
+      launchAttrs[attrs++].val.memSyncDomain = (cudaLaunchMemSyncDomain) ncclParamMemSyncDomain();
+    }
+    #endif
+    launchConfig.gridDim = grid;
+    launchConfig.blockDim = block;
+    launchConfig.attrs = launchAttrs;
+    launchConfig.numAttrs = attrs;
+    launchConfig.stream = launchStream;
+
+    CUDACHECK(cudaLaunchKernelExC(&launchConfig, fn, args));
+    return ncclSuccess;
+  }
+  #endif
+  // Standard kernel launch
+  CUDACHECK(cudaLaunchKernel(fn, grid, block, args, 0, launchStream));
   return ncclSuccess;
 }
 
@@ -1017,17 +1108,25 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
     // Reset queue to empty without destroying plans since those will be sent
     // back to us for reclaiming via callbackQueue.
     ncclIntruQueueConstruct(&comm->planQueue);
-    // Close strong stream "transaction" encompassing cuda launches
-    NCCLCHECKGOTO(ncclStrongStreamRelease(tasks->capturingGraph, &comm->deviceStream), result, resume1);
+    cudaStream_t launchStream = tasks->streams->stream; // First user stream gets launch
+    // Create dependency for deviceStream on launchStream. We know that deviceStream
+    // hasn't been modified since launchStream waited on it (in ncclLaunchPrepare),
+    // so we can say that launchStream subsumes it.
+    NCCLCHECKGOTO(ncclStrongStreamWaitStream(tasks->capturingGraph, &comm->deviceStream, launchStream, /*b_subsumes_a=*/true), result, resume1);
   resume1:
-    // Create dependency for user streams on nccl device work.
-    struct ncclCudaStreamList* sl = tasks->streams;
-    tasks->streams = nullptr; // reset streams to empty
+    // Create dependency for other user streams (skip launch stream) on deviceStream.
+    // Again, the user streams haven't been touched since deviceStream waited on them
+    // so we can say they are subsumed by deviceStream.
+    struct ncclCudaStreamList* sl = tasks->streams->next;
+    tasks->streams = nullptr; // Reset comm->tasks.streams to empty.
     while (sl != nullptr) {
-      NCCLCHECKGOTO(ncclStrongStreamWaitStream(tasks->capturingGraph, sl->stream, &comm->deviceStream), result, resume2);
+      NCCLCHECKGOTO(ncclStrongStreamWaitStream(tasks->capturingGraph, sl->stream, &comm->deviceStream, /*b_subsumes_a=*/true), result, resume2);
     resume2:
       sl = sl->next;
     }
+    // Release device stream as acquired in ncclLaunchPrepare()
+    NCCLCHECKGOTO(ncclStrongStreamRelease(tasks->capturingGraph, &comm->deviceStream), result, resume3);
+  resume3:;
   }
   return result;
 }
@@ -1364,12 +1463,12 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo const* inf
           NCCLCHECK(ncclChannelComputeFromBase(comm, channelBaseId, c, &channelId));
           if (isSendNotRecv) {
             if (comm->channels[channelId].peers[peer].send[1].connected == 0) { // P2P uses only 1 connector
-              comm->connectSend[peer] |= (1<<channelId);
+              comm->connectSend[peer] |= (1UL<<channelId);
               ncclGroupCommPreconnect(comm);
             }
           } else {
             if (comm->channels[channelId].peers[peer].recv[1].connected == 0) { // P2P uses only 1 connector
-              comm->connectRecv[peer] |= (1<<channelId);
+              comm->connectRecv[peer] |= (1UL<<channelId);
               ncclGroupCommPreconnect(comm);
             }
           }
@@ -1429,6 +1528,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo const* inf
       }
       if (l->stream == info->stream)
         break; // Already seen stream.
+      l = l->next;
     }
   }
   return ncclSuccess;
